@@ -1,13 +1,22 @@
-# Build stage - Rust compilation
-FROM rust:1.88-bookworm AS builder
+# Build stage - Ubuntu 24.04 (glibc 2.39) for ort-sys compatibility
+FROM ubuntu:24.04 AS builder
+
+# Prevent interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
 
 WORKDIR /app
 
-# Install build dependencies
+# Install build dependencies and Rust
 RUN apt-get update && apt-get install -y \
+    curl \
+    build-essential \
     pkg-config \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Rust 1.88
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.88.0
+ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Copy manifests
 COPY Cargo.toml Cargo.lock* ./
