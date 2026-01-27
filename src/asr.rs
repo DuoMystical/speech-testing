@@ -7,6 +7,7 @@ use std::path::Path;
 use tracing::{debug, info};
 
 /// ASR configuration
+#[derive(Clone)]
 pub struct AsrConfig {
     /// Sample rate (must be 16000)
     pub sample_rate: u32,
@@ -109,16 +110,17 @@ pub struct ParakeetAsr {
 
 impl ParakeetAsr {
     /// Load Parakeet-TDT model from directory containing ONNX files
-    pub fn new(model_dir: impl AsRef<Path>, config: AsrConfig) -> Result<Self, ort::Error> {
+    pub fn new(model_dir: impl AsRef<Path>, config: AsrConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let model_dir = model_dir.as_ref();
         info!("Loading Parakeet-TDT ASR from: {:?}", model_dir);
 
-        // Create execution providers with TensorRT priority
-        let eps = [
+        // Helper to create execution providers (can't clone EPs)
+        let trt_cache_path = model_dir.join("trt_cache").to_string_lossy().to_string();
+        let create_eps = || [
             ort::TensorRTExecutionProvider::default()
                 .with_fp16(true)
                 .with_engine_cache_enable(true)
-                .with_engine_cache_path(model_dir.join("trt_cache").to_string_lossy().to_string())
+                .with_engine_cache_path(trt_cache_path.clone())
                 .build(),
             ort::CUDAExecutionProvider::default().build(),
             ort::CPUExecutionProvider::default().build(),
@@ -128,21 +130,21 @@ impl ParakeetAsr {
         let encoder_path = model_dir.join("encoder.onnx");
         info!("Loading encoder from: {:?}", encoder_path);
         let encoder = Session::builder()?
-            .with_execution_providers(eps.clone())?
+            .with_execution_providers(create_eps())?
             .commit_from_file(&encoder_path)?;
 
         // Load decoder
         let decoder_path = model_dir.join("decoder.onnx");
         info!("Loading decoder from: {:?}", decoder_path);
         let decoder = Session::builder()?
-            .with_execution_providers(eps.clone())?
+            .with_execution_providers(create_eps())?
             .commit_from_file(&decoder_path)?;
 
         // Load joint network
         let joint_path = model_dir.join("joint.onnx");
         info!("Loading joint network from: {:?}", joint_path);
         let joint = Session::builder()?
-            .with_execution_providers(eps)?
+            .with_execution_providers(create_eps())?
             .commit_from_file(&joint_path)?;
 
         // Load vocabulary

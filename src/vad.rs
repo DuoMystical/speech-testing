@@ -7,6 +7,7 @@ use std::path::Path;
 use tracing::{debug, info};
 
 /// VAD configuration
+#[derive(Clone)]
 pub struct VadConfig {
     /// Speech probability threshold (0.0 - 1.0)
     pub threshold: f32,
