@@ -44,6 +44,13 @@ RUN pip3 install --no-cache-dir \
     onnxruntime-gpu \
     huggingface_hub
 
+# Find and symlink the ONNX Runtime library for Rust to load dynamically
+RUN ONNX_LIB=$(python3 -c "import onnxruntime; import os; print(os.path.join(os.path.dirname(onnxruntime.__file__), 'capi', 'libonnxruntime.so'))") && \
+    if [ -f "$ONNX_LIB" ]; then \
+        ln -sf "$ONNX_LIB" /usr/local/lib/libonnxruntime.so && \
+        ldconfig; \
+    fi
+
 # Copy the built binary
 COPY --from=builder /app/target/release/stt-server /usr/local/bin/
 
@@ -66,6 +73,9 @@ ENV RUST_LOG=info
 ENV ORT_TENSORRT_ENGINE_CACHE_ENABLE=1
 ENV ORT_TENSORRT_CACHE_PATH=/app/tensorrt-cache
 ENV ORT_TENSORRT_FP16_ENABLE=1
+# ONNX Runtime dynamic library path (ort load-dynamic feature)
+ENV ORT_DYLIB_PATH=/usr/local/lib/libonnxruntime.so
+ENV LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
 
 # Expose port
 EXPOSE 8080
