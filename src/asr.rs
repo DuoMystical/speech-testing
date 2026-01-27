@@ -2,7 +2,7 @@
 //!
 //! Streaming speech recognition using Parakeet-TDT 0.6B v3 with ONNX Runtime.
 
-use ort::{Session, Tensor};
+use ort::{session::Session, value::Tensor};
 use std::path::Path;
 use tracing::{debug, info};
 
@@ -105,13 +105,13 @@ impl ParakeetAsr {
         // Helper to create execution providers (can't clone EPs)
         let trt_cache_path = model_dir.join("trt_cache").to_string_lossy().to_string();
         let create_eps = || [
-            ort::TensorRTExecutionProvider::default()
+            ort::ep::TensorRT::default()
                 .with_fp16(true)
-                .with_engine_cache_enable(true)
-                .with_engine_cache_path(trt_cache_path.clone())
+                .with_engine_cache(true)
+                .with_engine_cache_path(&trt_cache_path)
                 .build(),
-            ort::CUDAExecutionProvider::default().build(),
-            ort::CPUExecutionProvider::default().build(),
+            ort::ep::CUDA::default().build(),
+            ort::ep::CPU::default().build(),
         ];
 
         // Load encoder
@@ -204,7 +204,7 @@ impl ParakeetAsr {
 
     /// Process audio chunk for streaming transcription
     pub fn process_chunk(
-        &self,
+        &mut self,
         samples: &[f32],
         state: &mut AsrState,
     ) -> Result<TranscriptResult, ort::Error> {
@@ -268,12 +268,15 @@ impl ParakeetAsr {
             "length" => input_lengths,
         ])?;
 
-        // Get encoder output
-        let encoder_out = encoder_outputs["outputs"]
+        // Get encoder output - copy data to owned types to release borrow
+        let (encoder_shape, encoder_data) = encoder_outputs["outputs"]
             .try_extract_tensor::<f32>()?;
+        let encoder_shape_owned: Vec<i64> = encoder_shape.iter().copied().collect();
+        let encoder_data_owned: Vec<f32> = encoder_data.to_vec();
+        drop(encoder_outputs);
 
         // Run greedy decoding with decoder and joint
-        let decoded_tokens = self.greedy_decode(&encoder_out)?;
+        let decoded_tokens = self.greedy_decode(&encoder_shape_owned, &encoder_data_owned)?;
 
         // Convert tokens to text
         let text = self.tokens_to_text(&decoded_tokens);
@@ -296,7 +299,7 @@ impl ParakeetAsr {
     }
 
     /// Finalize transcription (process remaining audio)
-    pub fn finalize(&self, state: &mut AsrState) -> Result<TranscriptResult, ort::Error> {
+    pub fn finalize(&mut self, state: &mut AsrState) -> Result<TranscriptResult, ort::Error> {
         // Process any remaining audio in buffer
         if !state.audio_buffer.is_empty() {
             // Pad to minimum length if needed
@@ -323,22 +326,22 @@ impl ParakeetAsr {
 
     /// Greedy decoding using decoder and joint network
     fn greedy_decode(
-        &self,
-        encoder_out: &ort::TensorRef<'_, f32>,
+        &mut self,
+        encoder_shape: &[i64],
+        encoder_data: &[f32],
     ) -> Result<Vec<usize>, ort::Error> {
         let mut tokens = Vec::new();
         let blank_id = 0;
 
-        // Get encoder output shape
-        let shape = encoder_out.view().shape();
-        let seq_len = shape[1];
-        let enc_dim = shape[2];
+        // Get encoder output shape [batch, seq_len, enc_dim]
+        let seq_len = encoder_shape[1] as usize;
+        let enc_dim = encoder_shape[2] as usize;
 
         for t in 0..seq_len {
-            // Get encoder output at time t
-            let enc_view = encoder_out.view();
+            // Get encoder output at time t (index into flat array)
+            // For shape [1, seq_len, enc_dim], index [0, t, i] = t * enc_dim + i
             let enc_t: Vec<f32> = (0..enc_dim)
-                .map(|i| enc_view[[0, t, i]])
+                .map(|i| encoder_data[t * enc_dim + i])
                 .collect();
 
             // Run decoder (simplified - actual implementation would maintain state)
@@ -354,14 +357,13 @@ impl ParakeetAsr {
                 "targets" => dec_input_tensor,
             ])?;
 
-            let dec_out = decoder_outputs["outputs"]
+            let (_, dec_out) = decoder_outputs["outputs"]
                 .try_extract_tensor::<f32>()?;
 
             // Run joint network
             let enc_tensor = Tensor::from_array(([1usize, enc_t.len()], enc_t))?;
 
-            let dec_view = dec_out.view();
-            let dec_vec: Vec<f32> = dec_view.iter().copied().collect();
+            let dec_vec: Vec<f32> = dec_out.iter().copied().collect();
             let dec_tensor = Tensor::from_array(([1usize, dec_vec.len()], dec_vec))?;
 
             let joint_outputs = self.joint.run(ort::inputs![
@@ -369,15 +371,14 @@ impl ParakeetAsr {
                 "decoder_outputs" => dec_tensor,
             ])?;
 
-            let logits = joint_outputs["outputs"]
+            let (_, logits) = joint_outputs["outputs"]
                 .try_extract_tensor::<f32>()?;
 
             // Find argmax token
-            let logits_view = logits.view();
             let mut max_idx = 0;
             let mut max_val = f32::NEG_INFINITY;
 
-            for (i, &v) in logits_view.iter().enumerate() {
+            for (i, &v) in logits.iter().enumerate() {
                 if v > max_val {
                     max_val = v;
                     max_idx = i;

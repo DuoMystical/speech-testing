@@ -2,7 +2,7 @@
 //!
 //! Uses the TEN VAD ONNX model for low-latency speech detection.
 
-use ort::{Session, Tensor};
+use ort::{session::Session, value::Tensor};
 use std::path::Path;
 use tracing::{debug, info};
 
@@ -103,11 +103,11 @@ impl TenVad {
         // Create ONNX Runtime session with TensorRT EP
         let session = Session::builder()?
             .with_execution_providers([
-                ort::TensorRTExecutionProvider::default()
+                ort::ep::TensorRT::default()
                     .with_fp16(true)
                     .build(),
-                ort::CUDAExecutionProvider::default().build(),
-                ort::CPUExecutionProvider::default().build(),
+                ort::ep::CUDA::default().build(),
+                ort::ep::CPU::default().build(),
             ])?
             .commit_from_file(model_path)?;
 
@@ -117,7 +117,7 @@ impl TenVad {
 
     /// Process a single frame of audio (10ms = 160 samples at 16kHz)
     pub fn process_frame(
-        &self,
+        &mut self,
         samples: &[f32],
         state: &mut VadState,
     ) -> Result<VadEvent, ort::Error> {
@@ -148,20 +148,15 @@ impl TenVad {
 
         // Extract outputs
         // TEN VAD outputs: prob (1,), h_out (1, hidden_size), c_out (1, hidden_size)
-        let prob: f32 = outputs["prob"]
-            .try_extract_tensor::<f32>()?
-            .view()
-            .iter()
-            .next()
-            .copied()
-            .unwrap_or(0.0);
+        let (_, prob_data) = outputs["prob"].try_extract_tensor::<f32>()?;
+        let prob: f32 = prob_data.first().copied().unwrap_or(0.0);
 
         // Update LSTM state
-        let h_out = outputs["h_out"].try_extract_tensor::<f32>()?;
-        let c_out = outputs["c_out"].try_extract_tensor::<f32>()?;
+        let (_, h_out) = outputs["h_out"].try_extract_tensor::<f32>()?;
+        let (_, c_out) = outputs["c_out"].try_extract_tensor::<f32>()?;
 
-        state.h_state.copy_from_slice(h_out.view().as_slice().unwrap());
-        state.c_state.copy_from_slice(c_out.view().as_slice().unwrap());
+        state.h_state.copy_from_slice(h_out);
+        state.c_state.copy_from_slice(c_out);
 
         // Update state machine
         let is_speech = prob > self.config.threshold;
@@ -199,7 +194,7 @@ impl TenVad {
 
     /// Process multiple frames of audio
     pub fn process_audio(
-        &self,
+        &mut self,
         samples: &[f32],
         state: &mut VadState,
     ) -> Result<Vec<VadEvent>, ort::Error> {
