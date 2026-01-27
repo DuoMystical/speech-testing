@@ -3,13 +3,13 @@
 //! Orchestrates voice activity detection and speech recognition.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 use tracing::{debug, info};
 
 use crate::asr::{AsrConfig, AsrState, ParakeetAsr};
 use crate::audio::pcm_i16_to_f32;
-use crate::vad::{TenVad, VadConfig, VadEvent, VadState};
+use crate::vad::{TenVad, VadConfig, VadEvent};
 use crate::SessionState;
 
 /// Events emitted by the STT pipeline
@@ -48,8 +48,8 @@ impl Default for PipelineConfig {
 
 /// Complete STT pipeline combining VAD and ASR
 pub struct SttPipeline {
-    vad: TenVad,
-    asr: ParakeetAsr,
+    vad: Mutex<TenVad>,
+    asr: Mutex<ParakeetAsr>,
     config: PipelineConfig,
 }
 
@@ -90,7 +90,11 @@ impl SttPipeline {
 
         info!("STT pipeline initialized successfully");
 
-        Ok(Self { vad, asr, config })
+        Ok(Self {
+            vad: Mutex::new(vad),
+            asr: Mutex::new(asr),
+            config,
+        })
     }
 
     /// Process audio samples through the pipeline
@@ -108,7 +112,7 @@ impl SttPipeline {
         let mut state = session_state.write().await;
 
         // Process through VAD
-        let vad_events = self.vad.process_audio(&samples_f32, &mut state.vad_state)?;
+        let vad_events = self.vad.lock().unwrap().process_audio(&samples_f32, &mut state.vad_state)?;
 
         for vad_event in vad_events {
             match vad_event {
@@ -133,8 +137,9 @@ impl SttPipeline {
 
                             // Create temporary ASR state for final processing
                             let mut asr_state = AsrState::new();
-                            let _ = self.asr.process_chunk(&audio_f32, &mut asr_state)?;
-                            let result = self.asr.finalize(&mut asr_state)?;
+                            let mut asr = self.asr.lock().unwrap();
+                            let _ = asr.process_chunk(&audio_f32, &mut asr_state)?;
+                            let result = asr.finalize(&mut asr_state)?;
 
                             if !result.text.is_empty() {
                                 events.push(SttEvent::FinalTranscript {
@@ -158,7 +163,7 @@ impl SttPipeline {
                             // Every ~1 second, emit partial
                             let audio_f32 = pcm_i16_to_f32(&state.audio_buffer);
                             let mut asr_state = AsrState::new();
-                            let result = self.asr.process_chunk(&audio_f32, &mut asr_state)?;
+                            let result = self.asr.lock().unwrap().process_chunk(&audio_f32, &mut asr_state)?;
 
                             if !result.text.is_empty() {
                                 events.push(SttEvent::PartialTranscript {
@@ -185,12 +190,12 @@ impl SttPipeline {
 
     /// Get VAD frame size in samples
     pub fn vad_frame_size(&self) -> usize {
-        self.vad.frame_size()
+        self.vad.lock().unwrap().frame_size()
     }
 
     /// Get sample rate
     pub fn sample_rate(&self) -> u32 {
-        self.vad.sample_rate()
+        self.vad.lock().unwrap().sample_rate()
     }
 }
 
