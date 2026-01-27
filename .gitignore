@@ -1,0 +1,32 @@
+# Rust
+/target/
+Cargo.lock
+
+# Models (too large for git)
+/models/
+/tensorrt-cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local

@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  stt-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      # Persist models so they don't re-download on restart
+      - stt-models:/app/models
+      - stt-tensorrt-cache:/app/tensorrt-cache
+    environment:
+      - MODELS_DIR=/app/models
+      - SCRIPTS_DIR=/app/scripts
+      - FRONTEND_PATH=/app/frontend
+      - PORT=8080
+      - RUST_LOG=info,stt_server=debug
+      - ORT_TENSORRT_ENGINE_CACHE_ENABLE=1
+      - ORT_TENSORRT_CACHE_PATH=/app/tensorrt-cache
+      - ORT_TENSORRT_FP16_ENABLE=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 600s  # 10 min for initial model download
+
+volumes:
+  stt-models:
+  stt-tensorrt-cache:
