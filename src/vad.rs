@@ -2,7 +2,7 @@
 //!
 //! Uses the TEN VAD ONNX model for low-latency speech detection.
 
-use ort::{inputs, Session, SessionOutputs};
+use ort::{Session, Tensor};
 use std::path::Path;
 use tracing::{debug, info};
 
@@ -128,23 +128,23 @@ impl TenVad {
             self.config.frame_size
         );
 
-        // Prepare inputs
+        // Prepare inputs as tensors
         // TEN VAD expects: input (1, frame_size), h (1, hidden_size), c (1, hidden_size)
-        let input = ndarray::Array2::from_shape_vec((1, samples.len()), samples.to_vec())
-            .expect("Failed to create input array");
+        let input_data: Vec<f32> = samples.to_vec();
+        let input = Tensor::from_array(([1usize, samples.len()], input_data))?;
 
-        let h_in = ndarray::Array2::from_shape_vec((1, state.h_state.len()), state.h_state.clone())
-            .expect("Failed to create h_state array");
+        let h_data: Vec<f32> = state.h_state.clone();
+        let h_in = Tensor::from_array(([1usize, state.h_state.len()], h_data))?;
 
-        let c_in = ndarray::Array2::from_shape_vec((1, state.c_state.len()), state.c_state.clone())
-            .expect("Failed to create c_state array");
+        let c_data: Vec<f32> = state.c_state.clone();
+        let c_in = Tensor::from_array(([1usize, state.c_state.len()], c_data))?;
 
         // Run inference
-        let outputs: SessionOutputs = self.session.run(inputs![
+        let outputs = self.session.run(ort::inputs![
             "input" => input,
             "h" => h_in,
             "c" => c_in,
-        ]?)?;
+        ])?;
 
         // Extract outputs
         // TEN VAD outputs: prob (1,), h_out (1, hidden_size), c_out (1, hidden_size)

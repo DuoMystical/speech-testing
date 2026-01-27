@@ -2,7 +2,7 @@
 //!
 //! Streaming speech recognition using Parakeet-TDT 0.6B v3 with ONNX Runtime.
 
-use ort::{inputs, Session, SessionOutputs};
+use ort::{Session, Tensor};
 use std::path::Path;
 use tracing::{debug, info};
 
@@ -41,8 +41,6 @@ impl Default for AsrConfig {
 
 /// Streaming ASR state
 pub struct AsrState {
-    /// Cached encoder states for streaming
-    cache: Option<EncoderCache>,
     /// Accumulated transcription
     pub transcript: String,
     /// Audio buffer for incomplete frames
@@ -54,7 +52,6 @@ pub struct AsrState {
 impl AsrState {
     pub fn new() -> Self {
         Self {
-            cache: None,
             transcript: String::new(),
             audio_buffer: Vec::new(),
             feature_buffer: Vec::new(),
@@ -62,7 +59,6 @@ impl AsrState {
     }
 
     pub fn reset(&mut self) {
-        self.cache = None;
         self.transcript.clear();
         self.audio_buffer.clear();
         self.feature_buffer.clear();
@@ -73,14 +69,6 @@ impl Default for AsrState {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Encoder cache for streaming inference
-struct EncoderCache {
-    /// Cached key-value states from attention layers
-    cache_states: Vec<f32>,
-    /// Number of processed frames
-    processed_frames: usize,
 }
 
 /// Transcription result
@@ -266,23 +254,19 @@ impl ParakeetAsr {
             state.feature_buffer.drain(..state.feature_buffer.len() - keep_frames);
         }
 
-        // Prepare encoder input
-        let batch_size = 1;
-        let seq_len = self.config.chunk_size_frames;
-        let feature_dim = self.config.n_mels;
+        // Prepare encoder input as tensor
+        let batch_size: usize = 1;
+        let seq_len: usize = self.config.chunk_size_frames;
+        let feature_dim: usize = self.config.n_mels;
 
-        let encoder_input = ndarray::Array3::from_shape_vec(
-            (batch_size, seq_len, feature_dim),
-            chunk_features,
-        ).expect("Failed to create encoder input");
-
-        let input_lengths = ndarray::Array1::from_vec(vec![seq_len as i64]);
+        let encoder_input = Tensor::from_array(([batch_size, seq_len, feature_dim], chunk_features))?;
+        let input_lengths = Tensor::from_array(([1usize], vec![seq_len as i64]))?;
 
         // Run encoder
-        let encoder_outputs: SessionOutputs = self.encoder.run(inputs![
+        let encoder_outputs = self.encoder.run(ort::inputs![
             "audio_signal" => encoder_input,
             "length" => input_lengths,
-        ]?)?;
+        ])?;
 
         // Get encoder output
         let encoder_out = encoder_outputs["outputs"]
@@ -340,21 +324,21 @@ impl ParakeetAsr {
     /// Greedy decoding using decoder and joint network
     fn greedy_decode(
         &self,
-        encoder_out: &ndarray::ArrayBase<ndarray::ViewRepr<&f32>, ndarray::Dim<ndarray::IxDynImpl>>,
+        encoder_out: &ort::TensorRef<'_, f32>,
     ) -> Result<Vec<usize>, ort::Error> {
         let mut tokens = Vec::new();
         let blank_id = 0;
 
         // Get encoder output shape
-        let seq_len = encoder_out.shape()[1];
-
-        // Initialize decoder state
-        let mut decoder_state = vec![0.0f32; 512]; // Placeholder state size
+        let shape = encoder_out.view().shape();
+        let seq_len = shape[1];
+        let enc_dim = shape[2];
 
         for t in 0..seq_len {
             // Get encoder output at time t
-            let enc_t: Vec<f32> = (0..encoder_out.shape()[2])
-                .map(|i| encoder_out[[0, t, i]])
+            let enc_view = encoder_out.view();
+            let enc_t: Vec<f32> = (0..enc_dim)
+                .map(|i| enc_view[[0, t, i]])
                 .collect();
 
             // Run decoder (simplified - actual implementation would maintain state)
@@ -364,38 +348,36 @@ impl ParakeetAsr {
                 vec![*tokens.last().unwrap() as i64]
             };
 
-            let dec_input_arr = ndarray::Array2::from_shape_vec((1, 1), dec_input)
-                .expect("Failed to create decoder input");
+            let dec_input_tensor = Tensor::from_array(([1usize, 1usize], dec_input))?;
 
-            let decoder_outputs: SessionOutputs = self.decoder.run(inputs![
-                "targets" => dec_input_arr,
-            ]?)?;
+            let decoder_outputs = self.decoder.run(ort::inputs![
+                "targets" => dec_input_tensor,
+            ])?;
 
             let dec_out = decoder_outputs["outputs"]
                 .try_extract_tensor::<f32>()?;
 
             // Run joint network
-            let enc_arr = ndarray::Array2::from_shape_vec((1, enc_t.len()), enc_t)
-                .expect("Failed to create enc array");
+            let enc_tensor = Tensor::from_array(([1usize, enc_t.len()], enc_t))?;
 
-            let dec_vec: Vec<f32> = dec_out.view().iter().copied().collect();
-            let dec_arr = ndarray::Array2::from_shape_vec((1, dec_vec.len()), dec_vec)
-                .expect("Failed to create dec array");
+            let dec_view = dec_out.view();
+            let dec_vec: Vec<f32> = dec_view.iter().copied().collect();
+            let dec_tensor = Tensor::from_array(([1usize, dec_vec.len()], dec_vec))?;
 
-            let joint_outputs: SessionOutputs = self.joint.run(inputs![
-                "encoder_outputs" => enc_arr,
-                "decoder_outputs" => dec_arr,
-            ]?)?;
+            let joint_outputs = self.joint.run(ort::inputs![
+                "encoder_outputs" => enc_tensor,
+                "decoder_outputs" => dec_tensor,
+            ])?;
 
             let logits = joint_outputs["outputs"]
                 .try_extract_tensor::<f32>()?;
 
             // Find argmax token
-            let logits_slice = logits.view();
+            let logits_view = logits.view();
             let mut max_idx = 0;
             let mut max_val = f32::NEG_INFINITY;
 
-            for (i, &v) in logits_slice.iter().enumerate() {
+            for (i, &v) in logits_view.iter().enumerate() {
                 if v > max_val {
                     max_val = v;
                     max_idx = i;

@@ -46,7 +46,7 @@ impl AppState {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             error!("Make sure the models are downloaded and exported:");
             error!("  python scripts/export_parakeet.py --output ./models/parakeet");
             error!("  python scripts/download_ten_vad.py --output ./models/ten_vad");
-            return Err(e.into());
+            return Err(e);
         }
     };
 
