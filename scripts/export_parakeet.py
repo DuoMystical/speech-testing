@@ -18,48 +18,85 @@ from pathlib import Path
 
 
 def export_parakeet_tdt(output_dir: str, model_name: str = "nvidia/parakeet-tdt-0.6b-v3"):
-    """Export Parakeet-TDT model to ONNX with cache support for streaming."""
+    """Export Parakeet-TDT model to ONNX for inference."""
     import nemo.collections.asr as nemo_asr
+    import torch
 
     print(f"Loading model: {model_name}")
     model = nemo_asr.models.ASRModel.from_pretrained(model_name)
+    model.eval()
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # Enable cache support for streaming inference
-    print("Configuring model for streaming export with cache support...")
-    model.set_export_config({
-        'cache_support': 'True',
-        'cache_last_channel': 'True',
-    })
+    # Export without streaming cache - simpler and more reliable
+    # Streaming can be handled at application level by processing chunks
+    print("Configuring model for standard ONNX export...")
+
+    # Disable cache support to avoid tensor shape issues during export
+    if hasattr(model, 'set_export_config'):
+        model.set_export_config({
+            'cache_support': 'False',
+        })
 
     # Export encoder
     encoder_path = output_path / "encoder.onnx"
     print(f"Exporting encoder to: {encoder_path}")
-    model.encoder.export(
-        str(encoder_path),
-        onnx_opset_version=17,
-        check_trace=False,
-    )
+    try:
+        model.encoder.export(
+            str(encoder_path),
+            onnx_opset_version=17,
+            check_trace=False,
+            dynamic_axes={
+                'audio_signal': {0: 'batch', 2: 'time'},
+                'length': {0: 'batch'},
+            },
+        )
+    except Exception as e:
+        print(f"Standard export failed: {e}")
+        print("Trying alternative export method...")
+        # Fallback: export with minimal config
+        model.encoder.export(
+            str(encoder_path),
+            onnx_opset_version=14,
+            check_trace=False,
+        )
 
-    # Export decoder (joint network for transducer)
+    # Export decoder (prediction network for transducer)
     decoder_path = output_path / "decoder.onnx"
     print(f"Exporting decoder to: {decoder_path}")
-    model.decoder.export(
-        str(decoder_path),
-        onnx_opset_version=17,
-        check_trace=False,
-    )
+    try:
+        model.decoder.export(
+            str(decoder_path),
+            onnx_opset_version=17,
+            check_trace=False,
+        )
+    except Exception as e:
+        print(f"Decoder export with opset 17 failed: {e}")
+        print("Trying with opset 14...")
+        model.decoder.export(
+            str(decoder_path),
+            onnx_opset_version=14,
+            check_trace=False,
+        )
 
     # Export joint network
     joint_path = output_path / "joint.onnx"
     print(f"Exporting joint network to: {joint_path}")
-    model.joint.export(
-        str(joint_path),
-        onnx_opset_version=17,
-        check_trace=False,
-    )
+    try:
+        model.joint.export(
+            str(joint_path),
+            onnx_opset_version=17,
+            check_trace=False,
+        )
+    except Exception as e:
+        print(f"Joint export with opset 17 failed: {e}")
+        print("Trying with opset 14...")
+        model.joint.export(
+            str(joint_path),
+            onnx_opset_version=14,
+            check_trace=False,
+        )
 
     # Save vocabulary/tokenizer
     vocab_path = output_path / "vocab.txt"
@@ -85,8 +122,9 @@ def export_parakeet_tdt(output_dir: str, model_name: str = "nvidia/parakeet-tdt-
         "n_mels": 80,
         "frame_length_ms": 25,
         "frame_shift_ms": 10,
-        "streaming": True,
-        "cache_support": True,
+        "window_size_ms": 400,  # Conformer typically uses ~400ms context
+        "subsampling_factor": 8,  # Conformer subsampling
+        "streaming": False,  # Streaming handled at application level
     }
     with open(config_path, 'w') as f:
         json.dump(config, f, indent=2)
@@ -104,23 +142,34 @@ def export_full_model(output_dir: str, model_name: str = "nvidia/parakeet-tdt-0.
 
     print(f"Loading model: {model_name}")
     model = nemo_asr.models.ASRModel.from_pretrained(model_name)
+    model.eval()
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # Enable cache support for streaming
-    model.set_export_config({
-        'cache_support': 'True',
-    })
+    # Disable cache support to avoid export issues
+    if hasattr(model, 'set_export_config'):
+        model.set_export_config({
+            'cache_support': 'False',
+        })
 
     onnx_path = output_path / "parakeet_tdt.onnx"
     print(f"Exporting full model to: {onnx_path}")
 
-    model.export(
-        str(onnx_path),
-        onnx_opset_version=17,
-        check_trace=False,
-    )
+    try:
+        model.export(
+            str(onnx_path),
+            onnx_opset_version=17,
+            check_trace=False,
+        )
+    except Exception as e:
+        print(f"Export with opset 17 failed: {e}")
+        print("Trying with opset 14...")
+        model.export(
+            str(onnx_path),
+            onnx_opset_version=14,
+            check_trace=False,
+        )
 
     print(f"\nExport complete! Model saved to: {onnx_path}")
     size_mb = onnx_path.stat().st_size / (1024 * 1024)
