@@ -18,32 +18,84 @@ from pathlib import Path
 
 
 def export_parakeet_tdt(output_dir: str, model_name: str = "nvidia/parakeet-tdt-0.6b-v3"):
-    """Export Parakeet-TDT model to ONNX with cache support for streaming."""
+    """Export Parakeet-TDT model to ONNX with streaming cache support."""
     import nemo.collections.asr as nemo_asr
+    import torch
 
     print(f"Loading model: {model_name}")
     model = nemo_asr.models.ASRModel.from_pretrained(model_name)
+    model.eval()
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # Enable cache support for streaming inference
-    print("Configuring model for streaming export with cache support...")
+    encoder = model.encoder
+
+    # Get encoder configuration
+    print("Analyzing encoder configuration...")
+    if hasattr(encoder, '_cfg'):
+        cfg = encoder._cfg
+        print(f"  - d_model: {getattr(cfg, 'd_model', 'unknown')}")
+        print(f"  - num_layers: {getattr(cfg, 'num_layers', 'unknown')}")
+        print(f"  - subsampling_factor: {getattr(cfg, 'subsampling_factor', 4)}")
+
+    # For Conformer with relative positional encoding, we need to configure
+    # the attention context size to match what we'll use during streaming
+    # The tensor mismatch occurs when pos_emb size doesn't match the attention window
+
+    # Configure streaming parameters on the encoder BEFORE setting export config
+    print("Configuring encoder for streaming...")
+
+    # Set attention context for streaming - this controls the positional embedding size
+    # att_context_size is [left_context, right_context] in frames
+    # For streaming, we typically use limited left context and 0 right context
+    if hasattr(encoder, 'set_streaming_cfg'):
+        # Use NeMo's streaming config setter
+        encoder.set_streaming_cfg(
+            chunk_size=32,  # Process 32 frames at a time (~320ms with 10ms shift)
+            left_context_size=32,  # Keep 32 frames of left context
+            right_context_size=0,  # No right context (causal/streaming)
+        )
+        print("  - Streaming config set via set_streaming_cfg")
+    elif hasattr(encoder, 'streaming_cfg'):
+        # Direct attribute access
+        encoder.streaming_cfg = {
+            'chunk_size': 32,
+            'left_context_size': 32,
+            'right_context_size': 0,
+        }
+        print("  - Streaming config set via streaming_cfg attribute")
+
+    # Reconfigure attention layers for streaming if needed
+    if hasattr(encoder, 'layers'):
+        for i, layer in enumerate(encoder.layers):
+            if hasattr(layer, 'self_attn'):
+                attn = layer.self_attn
+                # Set attention context size for relative positional encoding
+                if hasattr(attn, 'set_streaming'):
+                    attn.set_streaming(True)
+                # Some models use att_context_size
+                if hasattr(attn, 'att_context_size'):
+                    attn.att_context_size = [32, 0]  # [left, right] context
+
+    # Now set the export config for cache support
+    print("Setting export config with cache support...")
     model.set_export_config({
         'cache_support': 'True',
         'cache_last_channel': 'True',
     })
 
-    # Export encoder
+    # Export encoder with cache
     encoder_path = output_path / "encoder.onnx"
-    print(f"Exporting encoder to: {encoder_path}")
-    model.encoder.export(
+    print(f"Exporting encoder (with cache) to: {encoder_path}")
+    encoder.export(
         str(encoder_path),
         onnx_opset_version=17,
         check_trace=False,
     )
+    print("Encoder exported successfully with cache support!")
 
-    # Export decoder (joint network for transducer)
+    # Export decoder (prediction network for transducer)
     decoder_path = output_path / "decoder.onnx"
     print(f"Exporting decoder to: {decoder_path}")
     model.decoder.export(
@@ -85,6 +137,9 @@ def export_parakeet_tdt(output_dir: str, model_name: str = "nvidia/parakeet-tdt-
         "n_mels": 80,
         "frame_length_ms": 25,
         "frame_shift_ms": 10,
+        "chunk_size_frames": 32,  # Frames per chunk for streaming
+        "left_context_frames": 32,  # Cached left context
+        "subsampling_factor": 4,  # Conformer subsampling factor
         "streaming": True,
         "cache_support": True,
     }
@@ -99,18 +154,45 @@ def export_parakeet_tdt(output_dir: str, model_name: str = "nvidia/parakeet-tdt-
 
 
 def export_full_model(output_dir: str, model_name: str = "nvidia/parakeet-tdt-0.6b-v3"):
-    """Alternative: Export full model as single ONNX file."""
+    """Alternative: Export full model as single ONNX file with cache support."""
     import nemo.collections.asr as nemo_asr
 
     print(f"Loading model: {model_name}")
     model = nemo_asr.models.ASRModel.from_pretrained(model_name)
+    model.eval()
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # Enable cache support for streaming
+    # Configure encoder for streaming before export
+    encoder = model.encoder
+    if hasattr(encoder, 'set_streaming_cfg'):
+        encoder.set_streaming_cfg(
+            chunk_size=32,
+            left_context_size=32,
+            right_context_size=0,
+        )
+    elif hasattr(encoder, 'streaming_cfg'):
+        encoder.streaming_cfg = {
+            'chunk_size': 32,
+            'left_context_size': 32,
+            'right_context_size': 0,
+        }
+
+    # Configure attention layers
+    if hasattr(encoder, 'layers'):
+        for layer in encoder.layers:
+            if hasattr(layer, 'self_attn'):
+                attn = layer.self_attn
+                if hasattr(attn, 'set_streaming'):
+                    attn.set_streaming(True)
+                if hasattr(attn, 'att_context_size'):
+                    attn.att_context_size = [32, 0]
+
+    # Set export config with cache support
     model.set_export_config({
         'cache_support': 'True',
+        'cache_last_channel': 'True',
     })
 
     onnx_path = output_path / "parakeet_tdt.onnx"
