@@ -29,63 +29,71 @@ def export_parakeet_tdt(output_dir: str, model_name: str = "nvidia/parakeet-tdt-
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # Configure for streaming with cache support
-    print("Configuring model for streaming ONNX export with cache support...")
-
-    # For Conformer streaming, we need to configure the encoder's attention
-    # to use proper streaming settings before export
     encoder = model.encoder
 
-    # Check if this is a streaming-capable model and configure it
-    if hasattr(encoder, 'streaming_cfg') or hasattr(encoder, 'set_default_streaming_cfg'):
-        print("Model supports native streaming configuration")
-        if hasattr(encoder, 'set_default_streaming_cfg'):
-            encoder.set_default_streaming_cfg()
+    # Get encoder configuration
+    print("Analyzing encoder configuration...")
+    if hasattr(encoder, '_cfg'):
+        cfg = encoder._cfg
+        print(f"  - d_model: {getattr(cfg, 'd_model', 'unknown')}")
+        print(f"  - num_layers: {getattr(cfg, 'num_layers', 'unknown')}")
+        print(f"  - subsampling_factor: {getattr(cfg, 'subsampling_factor', 4)}")
 
-    # Set export config for cache support
-    # Use cache_last_channel which caches the last channel dimension (more stable)
+    # For Conformer with relative positional encoding, we need to configure
+    # the attention context size to match what we'll use during streaming
+    # The tensor mismatch occurs when pos_emb size doesn't match the attention window
+
+    # Configure streaming parameters on the encoder BEFORE setting export config
+    print("Configuring encoder for streaming...")
+
+    # Set attention context for streaming - this controls the positional embedding size
+    # att_context_size is [left_context, right_context] in frames
+    # For streaming, we typically use limited left context and 0 right context
+    if hasattr(encoder, 'set_streaming_cfg'):
+        # Use NeMo's streaming config setter
+        encoder.set_streaming_cfg(
+            chunk_size=32,  # Process 32 frames at a time (~320ms with 10ms shift)
+            left_context_size=32,  # Keep 32 frames of left context
+            right_context_size=0,  # No right context (causal/streaming)
+        )
+        print("  - Streaming config set via set_streaming_cfg")
+    elif hasattr(encoder, 'streaming_cfg'):
+        # Direct attribute access
+        encoder.streaming_cfg = {
+            'chunk_size': 32,
+            'left_context_size': 32,
+            'right_context_size': 0,
+        }
+        print("  - Streaming config set via streaming_cfg attribute")
+
+    # Reconfigure attention layers for streaming if needed
+    if hasattr(encoder, 'layers'):
+        for i, layer in enumerate(encoder.layers):
+            if hasattr(layer, 'self_attn'):
+                attn = layer.self_attn
+                # Set attention context size for relative positional encoding
+                if hasattr(attn, 'set_streaming'):
+                    attn.set_streaming(True)
+                # Some models use att_context_size
+                if hasattr(attn, 'att_context_size'):
+                    attn.att_context_size = [32, 0]  # [left, right] context
+
+    # Now set the export config for cache support
+    print("Setting export config with cache support...")
     model.set_export_config({
         'cache_support': 'True',
         'cache_last_channel': 'True',
     })
 
-    # Ensure encoder is in streaming mode if supported
-    if hasattr(encoder, 'setup_streaming_params'):
-        # Configure streaming with reasonable defaults
-        encoder.setup_streaming_params(
-            chunk_size=40,  # ~400ms at 10ms frame shift with 4x subsampling
-            left_chunks=-1,  # Unlimited left context in cache
-            max_context=5000,  # Max context frames
-        )
-
+    # Export encoder with cache
     encoder_path = output_path / "encoder.onnx"
     print(f"Exporting encoder (with cache) to: {encoder_path}")
-
-    try:
-        # Try export with cache support
-        encoder.export(
-            str(encoder_path),
-            onnx_opset_version=17,
-            check_trace=False,
-        )
-        print("Encoder exported successfully with cache support!")
-
-    except RuntimeError as e:
-        if "size of tensor" in str(e):
-            print(f"Cache export failed due to tensor mismatch: {e}")
-            print("Trying export without cache (streaming handled at app level)...")
-
-            # Reset export config to disable cache
-            model.set_export_config({'cache_support': 'False'})
-
-            encoder.export(
-                str(encoder_path),
-                onnx_opset_version=17,
-                check_trace=False,
-            )
-            print("Encoder exported without cache - streaming will be handled at application level")
-        else:
-            raise
+    encoder.export(
+        str(encoder_path),
+        onnx_opset_version=17,
+        check_trace=False,
+    )
+    print("Encoder exported successfully with cache support!")
 
     # Export decoder (prediction network for transducer)
     decoder_path = output_path / "decoder.onnx"
@@ -119,9 +127,6 @@ def export_parakeet_tdt(output_dir: str, model_name: str = "nvidia/parakeet-tdt-
             for token in vocab:
                 f.write(f"{token}\n")
 
-    # Check if cache export succeeded by looking at export config
-    cache_enabled = model._export_config.get('cache_support', 'False') == 'True'
-
     # Save model config
     config_path = output_path / "config.json"
     print(f"Saving config to: {config_path}")
@@ -132,10 +137,11 @@ def export_parakeet_tdt(output_dir: str, model_name: str = "nvidia/parakeet-tdt-
         "n_mels": 80,
         "frame_length_ms": 25,
         "frame_shift_ms": 10,
-        "window_size_ms": 400,  # Conformer typically uses ~400ms context
+        "chunk_size_frames": 32,  # Frames per chunk for streaming
+        "left_context_frames": 32,  # Cached left context
         "subsampling_factor": 4,  # Conformer subsampling factor
         "streaming": True,
-        "cache_support": cache_enabled,
+        "cache_support": True,
     }
     with open(config_path, 'w') as f:
         json.dump(config, f, indent=2)
@@ -158,34 +164,45 @@ def export_full_model(output_dir: str, model_name: str = "nvidia/parakeet-tdt-0.
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # Try with cache support first
-    if hasattr(model, 'set_export_config'):
-        model.set_export_config({
-            'cache_support': 'True',
-            'cache_last_channel': 'True',
-        })
+    # Configure encoder for streaming before export
+    encoder = model.encoder
+    if hasattr(encoder, 'set_streaming_cfg'):
+        encoder.set_streaming_cfg(
+            chunk_size=32,
+            left_context_size=32,
+            right_context_size=0,
+        )
+    elif hasattr(encoder, 'streaming_cfg'):
+        encoder.streaming_cfg = {
+            'chunk_size': 32,
+            'left_context_size': 32,
+            'right_context_size': 0,
+        }
+
+    # Configure attention layers
+    if hasattr(encoder, 'layers'):
+        for layer in encoder.layers:
+            if hasattr(layer, 'self_attn'):
+                attn = layer.self_attn
+                if hasattr(attn, 'set_streaming'):
+                    attn.set_streaming(True)
+                if hasattr(attn, 'att_context_size'):
+                    attn.att_context_size = [32, 0]
+
+    # Set export config with cache support
+    model.set_export_config({
+        'cache_support': 'True',
+        'cache_last_channel': 'True',
+    })
 
     onnx_path = output_path / "parakeet_tdt.onnx"
     print(f"Exporting full model to: {onnx_path}")
 
-    try:
-        model.export(
-            str(onnx_path),
-            onnx_opset_version=17,
-            check_trace=False,
-        )
-    except RuntimeError as e:
-        if "size of tensor" in str(e):
-            print(f"Cache export failed: {e}")
-            print("Retrying without cache support...")
-            model.set_export_config({'cache_support': 'False'})
-            model.export(
-                str(onnx_path),
-                onnx_opset_version=17,
-                check_trace=False,
-            )
-        else:
-            raise
+    model.export(
+        str(onnx_path),
+        onnx_opset_version=17,
+        check_trace=False,
+    )
 
     print(f"\nExport complete! Model saved to: {onnx_path}")
     size_mb = onnx_path.stat().st_size / (1024 * 1024)
