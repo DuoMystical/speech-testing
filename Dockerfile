@@ -18,6 +18,10 @@ RUN apt-get update && apt-get install -y \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.88.0
 ENV PATH="/root/.cargo/bin:${PATH}"
 
+# Force ort-sys to not download pre-built binaries (use load-dynamic instead)
+# This avoids glibc version issues with pre-built static libraries
+ENV ORT_STRATEGY=system
+
 # Copy manifests
 COPY Cargo.toml Cargo.lock* ./
 
