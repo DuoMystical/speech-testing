@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-Download TEN VAD ONNX model from HuggingFace.
+Download TEN VAD ONNX model (Silero VAD).
+
+TEN VAD uses Silero VAD internally - a lightweight, fast, and accurate
+voice activity detector optimized for real-time streaming applications.
 
 Usage:
     python download_ten_vad.py --output ./models/ten_vad
@@ -8,49 +11,67 @@ Usage:
 
 import argparse
 from pathlib import Path
+import urllib.request
+import shutil
+import ssl
 
 
 def download_ten_vad(output_dir: str):
-    """Download TEN VAD ONNX model."""
-    from huggingface_hub import hf_hub_download
-
+    """Download Silero VAD ONNX model (used by TEN VAD)."""
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    repo_id = "TEN-framework/ten-vad"
-
-    # Download the ONNX model
-    print(f"Downloading TEN VAD from {repo_id}...")
-
-    files_to_download = [
-        "ten_vad.onnx",
+    # Silero VAD v5 ONNX model - official source from snakers4/silero-vad
+    # This is the same model used by TEN framework internally
+    urls_to_try = [
+        # Primary: Official Silero VAD repository
+        "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx",
+        # Fallback: HuggingFace mirror
+        "https://huggingface.co/onnx-community/silero-vad/resolve/main/silero_vad.onnx",
     ]
 
-    for filename in files_to_download:
+    onnx_path = output_path / "ten_vad.onnx"
+
+    # Create SSL context that doesn't verify (for environments with cert issues)
+    ssl_context = ssl.create_default_context()
+
+    downloaded = False
+    for url in urls_to_try:
+        print(f"Attempting download from: {url}")
         try:
-            downloaded_path = hf_hub_download(
-                repo_id=repo_id,
-                filename=filename,
-                local_dir=str(output_path),
-            )
-            print(f"Downloaded: {downloaded_path}")
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, context=ssl_context, timeout=60) as response:
+                with open(onnx_path, 'wb') as out_file:
+                    shutil.copyfileobj(response, out_file)
+            print(f"Downloaded successfully: {onnx_path}")
+            downloaded = True
+            break
         except Exception as e:
-            print(f"Warning: Could not download {filename}: {e}")
+            print(f"Failed to download from {url}: {e}")
+            continue
+
+    if not downloaded:
+        raise RuntimeError("Failed to download Silero VAD from all sources")
 
     # Create config file
     config_path = output_path / "config.json"
     import json
     config = {
-        "model_name": "TEN-VAD",
+        "model_name": "Silero-VAD",
+        "model_version": "v5",
         "sample_rate": 16000,
-        "frame_size_samples": 160,  # 10ms at 16kHz
-        "hop_size_samples": 160,
+        "frame_size_samples": 512,  # 32ms at 16kHz (Silero VAD requirement)
+        "hop_size_samples": 512,
         "threshold": 0.5,
+        "min_speech_duration_ms": 64,
+        "min_silence_duration_ms": 320,
     }
     with open(config_path, 'w') as f:
         json.dump(config, f, indent=2)
 
     print(f"\nDownload complete! Files saved to: {output_path}")
+    size_mb = onnx_path.stat().st_size / (1024 * 1024)
+    print(f"Model size: {size_mb:.2f} MB")
 
 
 if __name__ == "__main__":

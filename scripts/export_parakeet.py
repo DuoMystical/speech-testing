@@ -39,44 +39,99 @@ def export_parakeet_tdt(output_dir: str, model_name: str = "nvidia/parakeet-tdt-
         print(f"  - num_layers: {getattr(cfg, 'num_layers', 'unknown')}")
         print(f"  - subsampling_factor: {getattr(cfg, 'subsampling_factor', 4)}")
 
-    # For Conformer with relative positional encoding, we need to configure
-    # the attention context size to match what we'll use during streaming
-    # The tensor mismatch occurs when pos_emb size doesn't match the attention window
+    # For FastConformer with relative positional encoding, we need to configure
+    # the attention context size to match the cache requirements.
+    # The tensor mismatch (10073 vs 5073) occurs because cache mode expects 2x the
+    # positional embeddings for [cached + new] context.
 
-    # Configure streaming parameters on the encoder BEFORE setting export config
-    print("Configuring encoder for streaming...")
+    print("Configuring encoder for streaming with cache support...")
 
-    # Set attention context for streaming - this controls the positional embedding size
-    # att_context_size is [left_context, right_context] in frames
-    # For streaming, we typically use limited left context and 0 right context
+    # Streaming chunk configuration
+    chunk_size = 32  # frames per chunk
+    left_context = 32  # cached left context frames
+    right_context = 0  # causal streaming
+
+    # Configure streaming via available methods
     if hasattr(encoder, 'set_streaming_cfg'):
-        # Use NeMo's streaming config setter
         encoder.set_streaming_cfg(
-            chunk_size=32,  # Process 32 frames at a time (~320ms with 10ms shift)
-            left_context_size=32,  # Keep 32 frames of left context
-            right_context_size=0,  # No right context (causal/streaming)
+            chunk_size=chunk_size,
+            left_context_size=left_context,
+            right_context_size=right_context,
         )
-        print("  - Streaming config set via set_streaming_cfg")
-    elif hasattr(encoder, 'streaming_cfg'):
-        # Direct attribute access
-        encoder.streaming_cfg = {
-            'chunk_size': 32,
-            'left_context_size': 32,
-            'right_context_size': 0,
-        }
-        print("  - Streaming config set via streaming_cfg attribute")
+        print(f"  - Streaming config set: chunk={chunk_size}, left={left_context}, right={right_context}")
 
-    # Reconfigure attention layers for streaming if needed
+    # Configure each layer's attention for streaming
+    # This is critical for proper positional embedding sizing
+    layers_configured = 0
     if hasattr(encoder, 'layers'):
-        for i, layer in enumerate(encoder.layers):
+        for layer in encoder.layers:
             if hasattr(layer, 'self_attn'):
                 attn = layer.self_attn
-                # Set attention context size for relative positional encoding
+                # Enable streaming mode
                 if hasattr(attn, 'set_streaming'):
                     attn.set_streaming(True)
-                # Some models use att_context_size
+                # Set attention context size [left, right]
                 if hasattr(attn, 'att_context_size'):
-                    attn.att_context_size = [32, 0]  # [left, right] context
+                    attn.att_context_size = [left_context, right_context]
+                    layers_configured += 1
+                # Some models use streaming_config attribute
+                if hasattr(attn, 'streaming_config'):
+                    attn.streaming_config = {
+                        'chunk_size': chunk_size,
+                        'left_context': left_context,
+                        'right_context': right_context,
+                    }
+
+    if layers_configured > 0:
+        print(f"  - Configured {layers_configured} attention layers for streaming")
+
+    # For FastConformer, we may need to adjust the positional encoding
+    # to handle the cache size properly
+    if hasattr(encoder, 'pos_enc'):
+        pos_enc = encoder.pos_enc
+        print(f"  - Positional encoding type: {type(pos_enc).__name__}")
+        # Check if we need to resize pos encoding for cache
+        if hasattr(pos_enc, 'max_len'):
+            current_max = pos_enc.max_len
+            # Cache mode needs 2x the positional embeddings
+            required_max = current_max * 2
+            print(f"  - Current max_len: {current_max}, required for cache: {required_max}")
+            # Extend positional encodings if needed
+            if hasattr(pos_enc, 'extend_pe'):
+                pos_enc.extend_pe(required_max)
+                print(f"  - Extended positional encodings to {required_max}")
+
+    # Check and configure relative positional bias for attention
+    if hasattr(encoder, 'self_attention_model'):
+        print(f"  - Self-attention model: {encoder.self_attention_model}")
+
+    # Set the streaming mode flag if available
+    if hasattr(encoder, 'streaming'):
+        encoder.streaming = True
+        print("  - Encoder streaming mode enabled")
+
+    # For FastConformer, we need to ensure the relative positional bias
+    # is properly sized for cache-aware export
+    # The bias table has size (2 * max_pos - 1) and cache doubles the sequence
+    if hasattr(encoder, 'layers'):
+        for layer in encoder.layers:
+            if hasattr(layer, 'self_attn'):
+                attn = layer.self_attn
+                # Check for rel_pos_bias in multi-head attention
+                if hasattr(attn, 'rel_pos_bias') and attn.rel_pos_bias is not None:
+                    rel_pos = attn.rel_pos_bias
+                    if hasattr(rel_pos, 'pe') and rel_pos.pe is not None:
+                        current_size = rel_pos.pe.size(0)
+                        print(f"  - Relative positional bias size: {current_size}")
+                        # Extend if needed for cache (2x for cache + current)
+                        if hasattr(rel_pos, 'extend_pe'):
+                            rel_pos.extend_pe(seq_length=current_size)
+                            print(f"  - Extended relative positional bias")
+
+    # For models with local attention, set the chunk length
+    if hasattr(encoder, '_cfg') and hasattr(encoder._cfg, 'att_context_size'):
+        encoder._cfg.att_context_size = [left_context, right_context]
+        print(f"  - Set cfg att_context_size to [{left_context}, {right_context}]")
 
     # Now set the export config for cache support
     print("Setting export config with cache support...")
@@ -88,12 +143,50 @@ def export_parakeet_tdt(output_dir: str, model_name: str = "nvidia/parakeet-tdt-
     # Export encoder with cache
     encoder_path = output_path / "encoder.onnx"
     print(f"Exporting encoder (with cache) to: {encoder_path}")
-    encoder.export(
-        str(encoder_path),
-        onnx_opset_version=17,
-        check_trace=False,
-    )
-    print("Encoder exported successfully with cache support!")
+
+    try:
+        encoder.export(
+            str(encoder_path),
+            onnx_opset_version=17,
+            check_trace=False,
+        )
+        print("Encoder exported successfully with cache support!")
+    except RuntimeError as e:
+        error_msg = str(e)
+        if "shape" in error_msg.lower() or "size" in error_msg.lower():
+            print(f"\nCache export failed with tensor mismatch: {e}")
+            print("\nAttempting export with adjusted positional encoding...")
+
+            # Try resetting and extending positional encodings
+            if hasattr(encoder, 'layers'):
+                for layer in encoder.layers:
+                    if hasattr(layer, 'self_attn'):
+                        attn = layer.self_attn
+                        if hasattr(attn, 'rel_pos_bias'):
+                            rel_pos = attn.rel_pos_bias
+                            # Try to recreate with larger size
+                            if hasattr(rel_pos, 'pe') and rel_pos.pe is not None:
+                                # Double the positional bias table
+                                old_size = rel_pos.pe.size(0)
+                                new_size = old_size * 2
+                                old_pe = rel_pos.pe
+                                # Create new larger tensor
+                                new_pe = torch.zeros(new_size, old_pe.size(1), device=old_pe.device, dtype=old_pe.dtype)
+                                # Center the old embeddings in new tensor
+                                start = (new_size - old_size) // 2
+                                new_pe[start:start + old_size] = old_pe
+                                rel_pos.pe = torch.nn.Parameter(new_pe, requires_grad=False)
+                                print(f"  - Resized positional bias from {old_size} to {new_size}")
+
+            # Retry export
+            encoder.export(
+                str(encoder_path),
+                onnx_opset_version=17,
+                check_trace=False,
+            )
+            print("Encoder exported successfully after adjustment!")
+        else:
+            raise
 
     # Export decoder (prediction network for transducer)
     decoder_path = output_path / "decoder.onnx"
@@ -156,6 +249,7 @@ def export_parakeet_tdt(output_dir: str, model_name: str = "nvidia/parakeet-tdt-
 def export_full_model(output_dir: str, model_name: str = "nvidia/parakeet-tdt-0.6b-v3"):
     """Alternative: Export full model as single ONNX file with cache support."""
     import nemo.collections.asr as nemo_asr
+    import torch
 
     print(f"Loading model: {model_name}")
     model = nemo_asr.models.ASRModel.from_pretrained(model_name)
@@ -164,20 +258,20 @@ def export_full_model(output_dir: str, model_name: str = "nvidia/parakeet-tdt-0.
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
+    # Streaming configuration
+    chunk_size = 32
+    left_context = 32
+    right_context = 0
+
     # Configure encoder for streaming before export
     encoder = model.encoder
     if hasattr(encoder, 'set_streaming_cfg'):
         encoder.set_streaming_cfg(
-            chunk_size=32,
-            left_context_size=32,
-            right_context_size=0,
+            chunk_size=chunk_size,
+            left_context_size=left_context,
+            right_context_size=right_context,
         )
-    elif hasattr(encoder, 'streaming_cfg'):
-        encoder.streaming_cfg = {
-            'chunk_size': 32,
-            'left_context_size': 32,
-            'right_context_size': 0,
-        }
+        print(f"  - Streaming config set: chunk={chunk_size}, left={left_context}, right={right_context}")
 
     # Configure attention layers
     if hasattr(encoder, 'layers'):
@@ -187,7 +281,12 @@ def export_full_model(output_dir: str, model_name: str = "nvidia/parakeet-tdt-0.
                 if hasattr(attn, 'set_streaming'):
                     attn.set_streaming(True)
                 if hasattr(attn, 'att_context_size'):
-                    attn.att_context_size = [32, 0]
+                    attn.att_context_size = [left_context, right_context]
+
+    # Extend positional encodings for cache
+    if hasattr(encoder, 'pos_enc') and hasattr(encoder.pos_enc, 'extend_pe'):
+        if hasattr(encoder.pos_enc, 'max_len'):
+            encoder.pos_enc.extend_pe(encoder.pos_enc.max_len * 2)
 
     # Set export config with cache support
     model.set_export_config({
@@ -198,13 +297,44 @@ def export_full_model(output_dir: str, model_name: str = "nvidia/parakeet-tdt-0.
     onnx_path = output_path / "parakeet_tdt.onnx"
     print(f"Exporting full model to: {onnx_path}")
 
-    model.export(
-        str(onnx_path),
-        onnx_opset_version=17,
-        check_trace=False,
-    )
+    try:
+        model.export(
+            str(onnx_path),
+            onnx_opset_version=17,
+            check_trace=False,
+        )
+        print(f"\nExport complete! Model saved to: {onnx_path}")
+    except RuntimeError as e:
+        error_msg = str(e)
+        if "shape" in error_msg.lower() or "size" in error_msg.lower():
+            print(f"\nCache export failed: {e}")
+            print("Attempting with adjusted positional encoding...")
 
-    print(f"\nExport complete! Model saved to: {onnx_path}")
+            # Resize positional bias for cache
+            if hasattr(encoder, 'layers'):
+                for layer in encoder.layers:
+                    if hasattr(layer, 'self_attn'):
+                        attn = layer.self_attn
+                        if hasattr(attn, 'rel_pos_bias') and attn.rel_pos_bias is not None:
+                            rel_pos = attn.rel_pos_bias
+                            if hasattr(rel_pos, 'pe') and rel_pos.pe is not None:
+                                old_size = rel_pos.pe.size(0)
+                                new_size = old_size * 2
+                                old_pe = rel_pos.pe
+                                new_pe = torch.zeros(new_size, old_pe.size(1), device=old_pe.device, dtype=old_pe.dtype)
+                                start = (new_size - old_size) // 2
+                                new_pe[start:start + old_size] = old_pe
+                                rel_pos.pe = torch.nn.Parameter(new_pe, requires_grad=False)
+
+            model.export(
+                str(onnx_path),
+                onnx_opset_version=17,
+                check_trace=False,
+            )
+            print(f"\nExport complete after adjustment! Model saved to: {onnx_path}")
+        else:
+            raise
+
     size_mb = onnx_path.stat().st_size / (1024 * 1024)
     print(f"Model size: {size_mb:.1f} MB")
 
