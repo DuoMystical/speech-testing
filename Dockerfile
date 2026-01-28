@@ -1,13 +1,26 @@
-# Build stage - Rust compilation
-FROM rust:1.88-bookworm AS builder
+# Build stage - Ubuntu 24.04 (glibc 2.39) for ort-sys compatibility
+FROM ubuntu:24.04 AS builder
+
+# Prevent interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
 
 WORKDIR /app
 
-# Install build dependencies
+# Install build dependencies and Rust
 RUN apt-get update && apt-get install -y \
+    curl \
+    build-essential \
     pkg-config \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Rust 1.88
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.88.0
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Force ort-sys to not download pre-built binaries (use load-dynamic instead)
+# This avoids glibc version issues with pre-built static libraries
+ENV ORT_STRATEGY=system
 
 # Copy manifests
 COPY Cargo.toml Cargo.lock* ./
@@ -44,6 +57,13 @@ RUN pip3 install --no-cache-dir \
     onnxruntime-gpu \
     huggingface_hub
 
+# Find and symlink the ONNX Runtime library for Rust to load dynamically
+RUN ONNX_LIB=$(python3 -c "import onnxruntime; import os; print(os.path.join(os.path.dirname(onnxruntime.__file__), 'capi', 'libonnxruntime.so'))") && \
+    if [ -f "$ONNX_LIB" ]; then \
+        ln -sf "$ONNX_LIB" /usr/local/lib/libonnxruntime.so && \
+        ldconfig; \
+    fi
+
 # Copy the built binary
 COPY --from=builder /app/target/release/stt-server /usr/local/bin/
 
@@ -66,6 +86,9 @@ ENV RUST_LOG=info
 ENV ORT_TENSORRT_ENGINE_CACHE_ENABLE=1
 ENV ORT_TENSORRT_CACHE_PATH=/app/tensorrt-cache
 ENV ORT_TENSORRT_FP16_ENABLE=1
+# ONNX Runtime dynamic library path (ort load-dynamic feature)
+ENV ORT_DYLIB_PATH=/usr/local/lib/libonnxruntime.so
+ENV LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
 
 # Expose port
 EXPOSE 8080
